@@ -2,9 +2,10 @@ use std::fs::OpenOptions;
 use std::os::unix::io::{AsRawFd, RawFd};
 
 // KVM ioctl numbers (from linux/kvm.h)
-// These are constructed as _IO(KVMIO, nr) where KVMIO = 0xAE
+// _IO(KVMIO, nr) where KVMIO = 0xAE
 const KVM_GET_API_VERSION: libc::c_ulong = 0xAE00;
 const KVM_CREATE_VM: libc::c_ulong = 0xAE01;
+const KVM_CREATE_VCPU: libc::c_ulong = 0xAE41;
 
 /// Wrapper for the KVM system interface
 struct Kvm {
@@ -19,7 +20,6 @@ impl Kvm {
             .write(true)
             .open("/dev/kvm")?;
 
-        // Prevent the file from being closed when `file` goes out of scope
         let fd = file.as_raw_fd();
         std::mem::forget(file);
 
@@ -56,7 +56,29 @@ struct Vm {
     fd: RawFd,
 }
 
+impl Vm {
+    /// Create a vCPU with the given ID (usually 0 for the first one)
+    fn create_vcpu(&self, id: u64) -> std::io::Result<Vcpu> {
+        let ret = unsafe { libc::ioctl(self.fd, KVM_CREATE_VCPU, id) };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Vcpu { fd: ret })
+    }
+}
+
 impl Drop for Vm {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.fd) };
+    }
+}
+
+/// Wrapper for a KVM virtual CPU
+struct Vcpu {
+    fd: RawFd,
+}
+
+impl Drop for Vcpu {
     fn drop(&mut self) {
         unsafe { libc::close(self.fd) };
     }
@@ -78,6 +100,10 @@ fn main() -> std::io::Result<()> {
     // Step 3: Create a VM
     let vm = kvm.create_vm()?;
     println!("✓ Created VM (fd: {})", vm.fd);
+
+    // Step 4: Create a vCPU
+    let vcpu = vm.create_vcpu(0)?;
+    println!("✓ Created vCPU (fd: {})", vcpu.fd);
 
     Ok(())
 }
