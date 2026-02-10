@@ -1,4 +1,5 @@
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::ptr;
 
@@ -12,11 +13,12 @@ const KVM_RUN: libc::c_ulong = 0xAE80;
 const KVM_GET_SREGS: libc::c_ulong = 0x8138AE83;
 const KVM_SET_SREGS: libc::c_ulong = 0x4138AE84;
 const KVM_SET_REGS: libc::c_ulong = 0x4090AE82;
-const KVM_GET_REGS: libc::c_ulong = 0x8090AE81;
 
 // KVM exit reasons
 const KVM_EXIT_HLT: u32 = 5;
 const KVM_EXIT_IO: u32 = 2;
+const KVM_EXIT_MMIO: u32 = 6;
+const KVM_EXIT_SHUTDOWN: u32 = 8;
 const KVM_EXIT_IO_OUT: u8 = 1;
 
 // Control register bits
@@ -27,11 +29,13 @@ const EFER_LME: u64 = 1 << 8;
 const EFER_LMA: u64 = 1 << 10;
 
 // Memory layout
-const BOOT_GDT_ADDR: u64 = 0x1000;
-const BOOT_PML4_ADDR: u64 = 0x2000;
-const BOOT_PDPT_ADDR: u64 = 0x3000;
-const BOOT_PD_ADDR: u64 = 0x4000;
-const BOOT_CODE_ADDR: u64 = 0x10000;
+const BOOT_GDT_ADDR: u64 = 0x500;
+const BOOT_PARAMS_ADDR: u64 = 0x7000;
+const CMDLINE_ADDR: u64 = 0x20000;
+const BOOT_PML4_ADDR: u64 = 0x9000;
+const BOOT_PDPT_ADDR: u64 = 0xa000;
+const BOOT_PD_ADDR: u64 = 0xb000;
+const KERNEL_LOAD_ADDR: u64 = 0x100000;
 
 // Page table flags
 const PTE_PRESENT: u64 = 1 << 0;
@@ -40,6 +44,16 @@ const PTE_HUGE: u64 = 1 << 7;
 
 const GDT_KERNEL_CODE: u16 = 1 << 3;
 const GDT_KERNEL_DATA: u16 = 2 << 3;
+
+// Linux boot protocol constants
+const BOOT_FLAG: u16 = 0xAA55;
+const HDRS_MAGIC: u32 = 0x53726448;
+const SETUP_HEADER_OFFSET: u64 = 0x1f1;
+const SETUP_HEADER_SIZE: usize = 0x7f;  // From 0x1f1 to ~0x270
+
+// E820 memory map
+const E820_RAM: u32 = 1;
+const E820_RESERVED: u32 = 2;
 
 #[repr(C)]
 struct KvmUserspaceMemoryRegion {
@@ -68,7 +82,7 @@ struct KvmSregs {
 }
 
 #[repr(C)]
-#[derive(Default, Debug)]
+#[derive(Default)]
 struct KvmRegs {
     rax: u64, rbx: u64, rcx: u64, rdx: u64, rsi: u64, rdi: u64, rsp: u64, rbp: u64,
     r8: u64, r9: u64, r10: u64, r11: u64, r12: u64, r13: u64, r14: u64, r15: u64,
@@ -84,6 +98,68 @@ struct KvmRun {
 
 #[repr(C)]
 struct KvmRunExitIo { direction: u8, size: u8, port: u16, count: u32, data_offset: u64 }
+
+#[repr(C, packed)]
+#[derive(Default, Clone, Copy)]
+struct E820Entry { addr: u64, size: u64, type_: u32 }
+
+struct BzImage {
+    setup_header: Vec<u8>,
+    protected_mode_kernel: Vec<u8>,
+    protocol_version: u16,
+    setup_sects: u8,
+}
+
+impl BzImage {
+    fn load(path: &str) -> std::io::Result<Self> {
+        let mut file = File::open(path)?;
+        
+        // Read boot flag
+        file.seek(SeekFrom::Start(0x1fe))?;
+        let mut buf = [0u8; 2];
+        file.read_exact(&mut buf)?;
+        if u16::from_le_bytes(buf) != BOOT_FLAG {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid boot flag"));
+        }
+
+        // Read header magic
+        file.seek(SeekFrom::Start(0x202))?;
+        let mut buf4 = [0u8; 4];
+        file.read_exact(&mut buf4)?;
+        if u32::from_le_bytes(buf4) != HDRS_MAGIC {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid header magic"));
+        }
+
+        // Read protocol version
+        file.seek(SeekFrom::Start(0x206))?;
+        file.read_exact(&mut buf)?;
+        let protocol_version = u16::from_le_bytes(buf);
+
+        // Read setup_sects
+        file.seek(SeekFrom::Start(0x1f1))?;
+        let mut buf1 = [0u8; 1];
+        file.read_exact(&mut buf1)?;
+        let setup_sects = if buf1[0] == 0 { 4 } else { buf1[0] };
+
+        // Read entire setup header (from 0x1f1 to end of setup)
+        file.seek(SeekFrom::Start(SETUP_HEADER_OFFSET))?;
+        let mut setup_header = vec![0u8; SETUP_HEADER_SIZE];
+        file.read_exact(&mut setup_header)?;
+
+        // Calculate protected mode kernel location
+        let setup_size = (setup_sects as u64 + 1) * 512;
+        file.seek(SeekFrom::End(0))?;
+        let file_size = file.stream_position()?;
+        let pm_size = file_size - setup_size;
+
+        // Read protected mode kernel
+        file.seek(SeekFrom::Start(setup_size))?;
+        let mut protected_mode_kernel = vec![0u8; pm_size as usize];
+        file.read_exact(&mut protected_mode_kernel)?;
+
+        Ok(BzImage { setup_header, protected_mode_kernel, protocol_version, setup_sects })
+    }
+}
 
 struct Kvm { fd: RawFd }
 impl Kvm {
@@ -131,11 +207,6 @@ impl Vcpu {
         let ret = unsafe { libc::ioctl(self.fd, KVM_SET_SREGS, sregs) };
         if ret < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
     }
-    fn get_regs(&self) -> std::io::Result<KvmRegs> {
-        let mut regs = KvmRegs::default();
-        let ret = unsafe { libc::ioctl(self.fd, KVM_GET_REGS, &mut regs) };
-        if ret < 0 { Err(std::io::Error::last_os_error()) } else { Ok(regs) }
-    }
     fn set_regs(&self, regs: &KvmRegs) -> std::io::Result<()> {
         let ret = unsafe { libc::ioctl(self.fd, KVM_SET_REGS, regs) };
         if ret < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
@@ -158,14 +229,10 @@ impl GuestMemory {
         if ptr == libc::MAP_FAILED { Err(std::io::Error::last_os_error()) } else { Ok(GuestMemory { ptr: ptr as *mut u8, size }) }
     }
     fn as_ptr(&self) -> *mut u8 { self.ptr }
-    fn write_u64(&self, offset: usize, val: u64) {
-        assert!(offset + 8 <= self.size);
-        unsafe { ptr::write_unaligned(self.ptr.add(offset) as *mut u64, val); }
-    }
-    fn write(&self, offset: usize, data: &[u8]) {
-        assert!(offset + data.len() <= self.size);
-        unsafe { ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(offset), data.len()); }
-    }
+    fn write_u8(&self, offset: usize, val: u8) { unsafe { *self.ptr.add(offset) = val; } }
+    fn write_u32(&self, offset: usize, val: u32) { unsafe { ptr::write_unaligned(self.ptr.add(offset) as *mut u32, val); } }
+    fn write_u64(&self, offset: usize, val: u64) { unsafe { ptr::write_unaligned(self.ptr.add(offset) as *mut u64, val); } }
+    fn write(&self, offset: usize, data: &[u8]) { unsafe { ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(offset), data.len()); } }
 }
 impl Drop for GuestMemory { fn drop(&mut self) { unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.size) }; } }
 
@@ -179,8 +246,50 @@ fn setup_page_tables(mem: &GuestMemory) {
 
 fn setup_gdt(mem: &GuestMemory) {
     mem.write_u64(BOOT_GDT_ADDR as usize, 0);
-    mem.write_u64((BOOT_GDT_ADDR + 8) as usize, 0x00af9a000000ffff);  // Code64
-    mem.write_u64((BOOT_GDT_ADDR + 16) as usize, 0x00cf92000000ffff); // Data64
+    mem.write_u64((BOOT_GDT_ADDR + 8) as usize, 0x00af9a000000ffff);
+    mem.write_u64((BOOT_GDT_ADDR + 16) as usize, 0x00cf92000000ffff);
+}
+
+fn setup_boot_params(mem: &GuestMemory, bzimage: &BzImage, cmdline: &str, mem_size: u64) {
+    let bp = BOOT_PARAMS_ADDR as usize;
+    
+    // Copy the setup header from bzImage
+    mem.write(bp + SETUP_HEADER_OFFSET as usize, &bzimage.setup_header);
+    
+    // Override/set specific fields
+    // type_of_loader at 0x210
+    mem.write_u8(bp + 0x210, 0xFF);
+    
+    // loadflags at 0x211: LOADED_HIGH | CAN_USE_HEAP | KEEP_SEGMENTS
+    mem.write_u8(bp + 0x211, 0x81);
+    
+    // heap_end_ptr at 0x224
+    mem.write_u32(bp + 0x224, 0xfe00);
+    
+    // cmd_line_ptr at 0x228
+    mem.write_u32(bp + 0x228, CMDLINE_ADDR as u32);
+    
+    // Write command line
+    mem.write(CMDLINE_ADDR as usize, cmdline.as_bytes());
+    mem.write_u8(CMDLINE_ADDR as usize + cmdline.len(), 0);
+    
+    // E820 memory map at 0x2d0, count at 0x1e8
+    // Entry 0: Usable RAM below 640KB
+    let e820_0 = E820Entry { addr: 0, size: 0x9fc00, type_: E820_RAM };
+    mem.write(bp + 0x2d0, unsafe { std::slice::from_raw_parts(&e820_0 as *const _ as *const u8, 20) });
+    
+    // Entry 1: Reserved (EBDA, ROM, etc)
+    let e820_1 = E820Entry { addr: 0x9fc00, size: 0x60400, type_: E820_RESERVED };
+    mem.write(bp + 0x2d0 + 20, unsafe { std::slice::from_raw_parts(&e820_1 as *const _ as *const u8, 20) });
+    
+    // Entry 2: Usable RAM above 1MB
+    let e820_2 = E820Entry { addr: 0x100000, size: mem_size - 0x100000, type_: E820_RAM };
+    mem.write(bp + 0x2d0 + 40, unsafe { std::slice::from_raw_parts(&e820_2 as *const _ as *const u8, 20) });
+    
+    mem.write_u8(bp + 0x1e8, 3); // 3 e820 entries
+    
+    // vid_mode at 0x1fa (0xFFFF = normal)
+    mem.write_u32(bp + 0x1fa, 0xFFFF);
 }
 
 fn make_code_segment() -> KvmSegment {
@@ -192,98 +301,44 @@ fn make_data_segment() -> KvmSegment {
 }
 
 fn main() -> std::io::Result<()> {
-    println!("=== microvm-rs: 64-bit Long Mode Verification ===\n");
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        println!("Usage: {} <bzImage> [cmdline]", args[0]);
+        return Ok(());
+    }
+    
+    let kernel_path = &args[1];
+    let cmdline = args.get(2).map(|s| s.as_str()).unwrap_or("console=ttyS0 earlyprintk=serial,ttyS0,115200");
+    
+    println!("=== microvm-rs: Linux Boot ===\n");
+
+    // Load bzImage
+    let bzimage = BzImage::load(kernel_path)?;
+    println!("✓ Loaded bzImage:");
+    println!("    Protocol: {}.{}", bzimage.protocol_version >> 8, bzimage.protocol_version & 0xff);
+    println!("    Setup sectors: {}", bzimage.setup_sects);
+    println!("    Kernel size: {} KB", bzimage.protected_mode_kernel.len() / 1024);
 
     let kvm = Kvm::new()?;
     println!("✓ KVM API version: {}", kvm.api_version()?);
 
     let vm = kvm.create_vm()?;
-    let mem_size = 128 << 20;
+    let mem_size: usize = 128 << 20;
     let guest_mem = GuestMemory::new(mem_size)?;
     vm.set_user_memory_region(0, 0, mem_size as u64, guest_mem.as_ptr() as u64)?;
-    println!("✓ VM created with {} MB RAM", mem_size >> 20);
+    println!("✓ VM: {} MB RAM", mem_size >> 20);
 
     setup_page_tables(&guest_mem);
     setup_gdt(&guest_mem);
-    println!("✓ Page tables & GDT initialized");
+    println!("✓ Page tables & GDT ready");
 
-    // 64-bit guest code that PROVES we're in long mode:
-    // 1. Load a 64-bit immediate into RAX (only works in 64-bit mode)
-    // 2. Use R8 register (doesn't exist in 32-bit mode)
-    // 3. Do 64-bit arithmetic
-    // 4. Output result to serial port
-    //
-    // If this runs successfully, we MUST be in 64-bit mode!
-    
-    #[rustfmt::skip]
-    let guest_code: &[u8] = &[
-        // mov rax, 0xDEADBEEF12345678  (64-bit immediate - ONLY valid in long mode!)
-        0x48, 0xb8, 0x78, 0x56, 0x34, 0x12, 0xef, 0xbe, 0xad, 0xde,
-        
-        // mov r8, rax  (R8 register - ONLY exists in 64-bit mode!)
-        0x49, 0x89, 0xc0,
-        
-        // shr r8, 32  (shift right 32 bits to get upper half)
-        0x49, 0xc1, 0xe8, 0x20,
-        
-        // cmp r8d, 0xDEADBEEF  (verify upper 32 bits)
-        0x41, 0x81, 0xf8, 0xef, 0xbe, 0xad, 0xde,
-        
-        // jne fail (if not equal, we're not in 64-bit mode)
-        0x75, 0x30,
-        
-        // === SUCCESS: Output "64-bit OK!" ===
-        // mov dx, 0x3f8
-        0x66, 0xba, 0xf8, 0x03,
-        
-        // Output '6'
-        0xb0, 0x36, 0xee,
-        // Output '4'
-        0xb0, 0x34, 0xee,
-        // Output '-'
-        0xb0, 0x2d, 0xee,
-        // Output 'b'
-        0xb0, 0x62, 0xee,
-        // Output 'i'
-        0xb0, 0x69, 0xee,
-        // Output 't'
-        0xb0, 0x74, 0xee,
-        // Output ' '
-        0xb0, 0x20, 0xee,
-        // Output 'O'
-        0xb0, 0x4f, 0xee,
-        // Output 'K'
-        0xb0, 0x4b, 0xee,
-        // Output '!'
-        0xb0, 0x21, 0xee,
-        // Output '\n'
-        0xb0, 0x0a, 0xee,
-        
-        // Store magic value in RAX for verification: 0x6464 ("dd" = 64-bit mode marker)
-        0x48, 0xc7, 0xc0, 0x64, 0x64, 0x00, 0x00,
-        
-        // hlt
-        0xf4,
-        
-        // === FAIL path ===
-        // Output "FAIL"
-        0x66, 0xba, 0xf8, 0x03,
-        0xb0, 0x46, 0xee,  // 'F'
-        0xb0, 0x41, 0xee,  // 'A'
-        0xb0, 0x49, 0xee,  // 'I'
-        0xb0, 0x4c, 0xee,  // 'L'
-        0xb0, 0x0a, 0xee,  // '\n'
-        
-        // Store 0 in RAX to indicate failure
-        0x48, 0x31, 0xc0,
-        
-        // hlt
-        0xf4,
-    ];
-    
-    guest_mem.write(BOOT_CODE_ADDR as usize, guest_code);
-    println!("✓ Loaded 64-bit verification code ({} bytes)", guest_code.len());
-    println!("  Test: Load 0xDEADBEEF12345678 into RAX, verify with R8");
+    // Load kernel at 1MB
+    guest_mem.write(KERNEL_LOAD_ADDR as usize, &bzimage.protected_mode_kernel);
+    println!("✓ Kernel loaded at 0x{:x}", KERNEL_LOAD_ADDR);
+
+    setup_boot_params(&guest_mem, &bzimage, cmdline, mem_size as u64);
+    println!("✓ Boot params at 0x{:x}", BOOT_PARAMS_ADDR);
+    println!("✓ Cmdline: \"{}\"", cmdline);
 
     let vcpu = vm.create_vcpu(0)?;
     let vcpu_mmap_size = kvm.vcpu_mmap_size()?;
@@ -303,56 +358,60 @@ fn main() -> std::io::Result<()> {
     sregs.cr4 = CR4_PAE;
     sregs.efer = EFER_LME | EFER_LMA;
     vcpu.set_sregs(&sregs)?;
-    println!("✓ Long mode enabled (EFER.LME=1, EFER.LMA=1)");
 
     let mut regs = KvmRegs::default();
-    regs.rip = BOOT_CODE_ADDR;
+    regs.rip = KERNEL_LOAD_ADDR + 0x200;  // 64-bit entry point
+    regs.rsi = BOOT_PARAMS_ADDR;
     regs.rflags = 0x2;
-    regs.rsp = 0x8000;
     vcpu.set_regs(&regs)?;
+    println!("✓ vCPU: RIP=0x{:x}, RSI=0x{:x}", regs.rip, regs.rsi);
 
-    println!("\n▶ Running 64-bit verification test...\n");
+    println!("\n▶ Booting...\n");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    let mut output = String::new();
+    let mut line = String::new();
+    let mut exit_count = 0u64;
     loop {
         vcpu.run()?;
         let exit_reason = unsafe { (*kvm_run).exit_reason };
+        exit_count += 1;
 
         match exit_reason {
-            KVM_EXIT_HLT => {
-                let final_regs = vcpu.get_regs()?;
-                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                println!("Guest output: {}", output);
-                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                println!("\nFinal register state:");
-                println!("  RAX = 0x{:016x}", final_regs.rax);
-                println!("  R8  = 0x{:016x}", final_regs.r8);
-                println!("  RIP = 0x{:016x}", final_regs.rip);
-                
-                if final_regs.rax == 0x6464 {
-                    println!("\n🎉 SUCCESS: 64-bit long mode VERIFIED!");
-                    println!("   ✓ 64-bit immediate load worked");
-                    println!("   ✓ R8 register accessible");
-                    println!("   ✓ 64-bit shift operation worked");
-                } else {
-                    println!("\n❌ FAILED: Not in 64-bit mode!");
-                }
-                break;
-            }
-            KVM_EXIT_IO => {
+            KVM_EXIT_IO => { let io = unsafe { &*((&(*kvm_run)._union) as *const _ as *const KvmRunExitIo) }; if io.port != 0x3f8 && io.port != 0x80 { eprintln!("IO: port=0x{:x} dir={} size={}", io.port, io.direction, io.size); }
                 let io = unsafe { &*((&(*kvm_run)._union) as *const _ as *const KvmRunExitIo) };
                 if io.direction == KVM_EXIT_IO_OUT && io.port == 0x3f8 {
                     let byte = unsafe { *(kvm_run as *const u8).add(io.data_offset as usize) };
-                    if byte != 0x0a { output.push(byte as char); }
+                    if byte == b'\n' || byte == b'\r' {
+                        if !line.is_empty() || byte == b'\n' {
+                            println!("{}", line);
+                            line.clear();
+                        }
+                    } else if byte >= 0x20 || byte == b'\t' {
+                        line.push(byte as char);
+                    }
                 }
             }
+            KVM_EXIT_HLT => {
+                if !line.is_empty() { println!("{}", line); }
+                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                println!("\n✓ HLT after {} VM exits", exit_count);
+                break;
+            }
+            KVM_EXIT_SHUTDOWN => {
+                if !line.is_empty() { println!("{}", line); }
+                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                println!("\n⚠ SHUTDOWN after {} VM exits", exit_count);
+                break;
+            }
+            KVM_EXIT_MMIO => {}
             _ => {
-                println!("⚠ Unexpected exit: {}", exit_reason);
+                if !line.is_empty() { println!("{}", line); }
+                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                println!("\n⚠ Exit reason {} after {} VM exits", exit_reason, exit_count);
                 break;
             }
         }
+        if exit_count > 100_000_000 { println!("\n⚠ Too many exits"); break; }
     }
-
-    println!("\n=== Test complete ===");
     Ok(())
 }
