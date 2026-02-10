@@ -265,9 +265,9 @@ fn main() -> std::io::Result<()> {
     println!("✓ Created VM");
 
     // 4. Allocate guest memory (1 MB)
-    let mem_size = 1 << 20;
+    let mem_size = 128 << 20; // 128 MB
     let guest_mem = GuestMemory::new(mem_size)?;
-    println!("✓ Allocated {} KB guest memory", mem_size / 1024);
+    println!("✓ Allocated {} MB guest memory", mem_size / (1024 * 1024));
 
     // 5. Register memory with KVM
     vm.set_user_memory_region(0, 0, mem_size as u64, guest_mem.as_ptr() as u64)?;
